@@ -1,7 +1,7 @@
 import os
 import logging
 from flask import Flask, request
-import telegram
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import requests
 import asyncio
@@ -43,13 +43,13 @@ async def deepseek_response(user_message: str) -> str:
         logger.error(f"Deepseek API xatosi: {e}")
         return "Kechirasiz, hozir javob bera olmayman. Birozdan so‘ng urinib ko‘ring."
 
-async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Assalomu alaykum! Men Deepseek AI botiman. Savolingizni yozing.")
 
-async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     logger.info(f"Xabar: {user_text}")
-    await update.message.chat.send_action(action=telegram.constants.ChatAction.TYPING)
+    await update.message.chat.send_action(action="typing")
     reply = await deepseek_response(user_text)
     await update.message.reply_text(reply)
 
@@ -61,36 +61,61 @@ def setup_application():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return application
 
-def set_webhook_once():
-    """Webhook o‘rnatish (faqat bir marta bajariladi)"""
+async def setup_webhook_async():
+    """Webhook o‘rnatish (asinxron versiya)"""
     webhook_url = os.environ.get('RENDER_EXTERNAL_URL')
     if not webhook_url:
         logger.warning("RENDER_EXTERNAL_URL topilmadi. Webhook o‘rnatilmadi.")
         return
+    
     full_url = f"{webhook_url.rstrip('/')}/webhook"
     try:
-        # Bot obyektini olish
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        # Webhook o‘rnatish (sinxron usulda)
-        current_webhook = bot.get_webhook_info()
-        if current_webhook.url != full_url:
-            bot.set_webhook(url=full_url)
+        # Bot yaratish
+        bot = Bot(token=TELEGRAM_TOKEN)
+        
+        # Mavjud webhookni tekshirish
+        webhook_info = await bot.get_webhook_info()
+        
+        if webhook_info.url != full_url:
+            await bot.set_webhook(url=full_url)
             logger.info(f"Webhook o‘rnatildi: {full_url}")
         else:
             logger.info("Webhook allaqachon to‘g‘ri o‘rnatilgan.")
     except Exception as e:
         logger.error(f"Webhook o‘rnatishda xatolik: {e}")
 
-# Webhook o‘rnatishni modul yuklanganda bajarish (gunicorn bilan ishlaganda ham)
-set_webhook_once()
+def setup_webhook_sync():
+    """Webhook o‘rnatish (sinxron wrapper)"""
+    try:
+        # Yangi event loop yaratish
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_webhook_async())
+        loop.close()
+    except Exception as e:
+        logger.error(f"Webhook o‘rnatishda xatolik (sync wrapper): {e}")
+
+# Webhook o‘rnatish (sinxron wrapper orqali)
+setup_webhook_sync()
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     if request.method == 'POST':
         # Application mavjudligini tekshirish
         app = setup_application()
-        update = telegram.Update.de_json(request.get_json(force=True), app.bot)
-        asyncio.run_coroutine_threadsafe(app.process_update(update), app.loop)
+        
+        # Yangi event loop yaratish
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            update = Update.de_json(request.get_json(force=True), app.bot)
+            loop.run_until_complete(app.process_update(update))
+        except Exception as e:
+            logger.error(f"Webhook processing xatosi: {e}")
+        finally:
+            loop.close()
+            
         return 'OK', 200
     return 'OK', 200
 
@@ -101,7 +126,6 @@ def index():
 # Gunicorn uchun WSGI entry point
 app = flask_app
 
-# Agar skript to‘g‘ridan-to‘g‘ri ishga tushirilsa (masalan, lokal test uchun)
 if __name__ == '__main__':
     setup_application()
     port = int(os.environ.get('PORT', 10000))
